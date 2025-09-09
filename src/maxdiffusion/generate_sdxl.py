@@ -27,6 +27,11 @@ from jax.sharding import PartitionSpec as P
 import flax.linen as nn
 from flax.linen import partitioning as nn_partitioning
 
+# SGN / schedules / precomputed embeddings utilities
+from maxdiffusion.utils.sgn import build_sgn_latents
+from maxdiffusion.utils.schedules import cosine_fade, linear_ramp
+from maxdiffusion.utils.text_embed_cache import load_precomputed_embed_pt
+
 from maxdiffusion import pyconfig, max_utils
 from maxdiffusion.image_processor import VaeImageProcessor
 from maxdiffusion.maxdiffusion_utils import (
@@ -48,7 +53,7 @@ class GenerateSDXL(StableDiffusionXLTrainer):
     super().__init__(config)
 
 
-def loop_body(step, args, model, pipeline, added_cond_kwargs, prompt_embeds, guidance_scale, guidance_rescale, config):
+def loop_body(step, args, model, pipeline, added_cond_kwargs, prompt_embeds, guidance_curve, guidance_rescale, config):
   latents, scheduler_state, state = args
 
   if config.do_classifier_free_guidance:
@@ -74,7 +79,8 @@ def loop_body(step, args, model, pipeline, added_cond_kwargs, prompt_embeds, gui
     return noise_pred, noise_prediction_text
 
   if config.do_classifier_free_guidance:
-    noise_pred, noise_prediction_text = apply_classifier_free_guidance(noise_pred, guidance_scale)
+    gs = guidance_curve[step]
+    noise_pred, noise_prediction_text = apply_classifier_free_guidance(noise_pred, gs)
 
     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
     # Helps solve overexposure problem when terminal SNR approaches zero.
@@ -132,7 +138,13 @@ def get_unet_inputs(pipeline, params, states, config, rng, mesh, batch_size):
       "text_encoder": states["text_encoder_state"].params,
       "text_encoder_2": states["text_encoder_2_state"].params,
   }
-  prompt_embeds, pooled_embeds = get_embeddings(prompt_ids, pipeline, text_encoder_params)
+  if getattr(config, "use_precomputed_embeddings", False) and getattr(config, "embeddings_path", None):
+    embeds = load_precomputed_embed_pt(config.embeddings_path)
+    # concatenate CLIP-L token embeddings with pooled bigG embeddings as SDXL expects
+    prompt_embeds = jnp.concatenate([embeds["clip_l"][0], embeds["clip_g"][1]], axis=-1)
+    pooled_embeds = embeds["clip_l"][1]
+  else:
+    prompt_embeds, pooled_embeds = get_embeddings(prompt_ids, pipeline, text_encoder_params)
 
   batch_size = prompt_embeds.shape[0]
   add_time_ids = get_add_time_ids(
@@ -164,13 +176,26 @@ def get_unet_inputs(pipeline, params, states, config, rng, mesh, batch_size):
       width // vae_scale_factor,
   )
 
-  latents = jax.random.normal(rng, shape=latents_shape, dtype=jnp.float32)
-
-  scheduler_state = pipeline.scheduler.set_timesteps(
-      params["scheduler"], num_inference_steps=num_inference_steps, shape=latents.shape
-  )
-
-  latents = latents * scheduler_state.init_noise_sigma
+  if getattr(config, "use_sgn", False) and getattr(config, "wildcard_embeddings_path", None):
+    wildcard_embed = load_precomputed_embed_pt(config.wildcard_embeddings_path)
+    latents = build_sgn_latents(
+        rng=rng,
+        wildcard_embed=wildcard_embed,
+        pipeline=pipeline,
+        alpha=getattr(config, "alpha", 0.2),
+        lowres_steps=getattr(config, "lowres_hyper_steps", 1),
+        lowres_size=getattr(config, "lowres_size", 256),
+        target_size=config.resolution,
+    )
+    scheduler_state = pipeline.scheduler.set_timesteps(
+        params["scheduler"], num_inference_steps=num_inference_steps, shape=latents.shape
+    )
+  else:
+    latents = jax.random.normal(rng, shape=latents_shape, dtype=jnp.float32)
+    scheduler_state = pipeline.scheduler.set_timesteps(
+        params["scheduler"], num_inference_steps=num_inference_steps, shape=latents.shape
+    )
+    latents = latents * scheduler_state.init_noise_sigma
 
   added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
   latents = jax.device_put(latents, data_sharding)
@@ -196,6 +221,10 @@ def run_inference(states, pipeline, params, config, rng, mesh, batch_size):
   (latents, prompt_embeds, added_cond_kwargs, guidance_scale, guidance_rescale, scheduler_state) = get_unet_inputs(
       pipeline, params, states, config, rng, mesh, batch_size
   )
+  if getattr(config, "cfg_mode", "constant") == "ramp":
+    guidance_curve = linear_ramp(config.num_inference_steps, 0.0, float(guidance_scale[0]))
+  else:
+    guidance_curve = jnp.ones((config.num_inference_steps,), dtype=jnp.float32) * float(guidance_scale[0])
 
   loop_body_p = functools.partial(
       loop_body,
@@ -203,7 +232,7 @@ def run_inference(states, pipeline, params, config, rng, mesh, batch_size):
       pipeline=pipeline,
       added_cond_kwargs=added_cond_kwargs,
       prompt_embeds=prompt_embeds,
-      guidance_scale=guidance_scale,
+      guidance_curve=guidance_curve,
       guidance_rescale=guidance_rescale,
       config=config,
   )
